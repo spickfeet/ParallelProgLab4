@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <corecrt_math.h>
 #include <stdlib.h>
 #include <ctime>
@@ -112,90 +113,114 @@
 //    return 0;
 //}
 
-void matrix_vector_multiply(double* matrix, double* vector, double* result, int rows, int cols, int rank, int size) {
-    // Каждый процесс вычисляет часть результата
-    int rows_per_process = rows / size;
-    int start_row = rank * rows_per_process;
-    int end_row = (rank == size - 1) ? rows : start_row + rows_per_process;
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
-    // Локальные вычисления
-    for (int i = start_row; i < end_row; i++) {
-        result[i] = 0.0;
-        for (int j = 0; j < cols; j++) {
-            result[i] += matrix[i * cols + j] * vector[j];
+void multiply_block(int* block, int* vector, int* result, int block_size, int N) {
+    for (int i = 0; i < block_size; i++) {
+        result[i] = 0;
+        for (int j = 0; j < N; j++) {
+            result[i] += block[i * N + j] * vector[j];
         }
     }
 }
 
-int main(int argc, char** argv) {
-    srand(time(0));
+int main(int argc, char* argv[]) {
     int rank, size;
-    int rows = 3;  // Примерный размер матрицы
-    int cols = 3;
-    double* matrix = NULL, * vector = NULL, * result = NULL;
+    const int M = 4, N = 4;  // Размеры матрицы и вектора
+    int* matrix = NULL;
+    int* vector = NULL;
+    int* result = NULL;
+    MPI_Datatype block_type, resized_block_type;
 
-    // Инициализация MPI
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Генерация данных
-    if (rank == 0) {
-        matrix = (double*)malloc(rows * cols * sizeof(double));
-        vector = (double*)malloc(cols * sizeof(double));
-        result = (double*)malloc(rows * sizeof(double));
+    // Размер блока для каждого процесса
+    int block_size = M / size;
+    if (M % size != 0) {
+        if (rank == 0) {
+            printf("Ошибка: матрица не делится на равные блоки по строкам!\n");
+        }
+        MPI_Finalize();
+        return -1;
+    }
 
-        // Заполнение матрицы и вектора единицами
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                matrix[i * cols + j] = 1.0 * (rand() % 10);  // Заполнение единицами
+    if (rank == 0) {
+        matrix = (int*)malloc(M * N * sizeof(int));
+        vector = (int*)malloc(N * sizeof(int));
+        result = (int*)malloc(M * sizeof(int));
+
+        // Генерация данных
+        srand(time(NULL));
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                matrix[i * N + j] = i * N + j;
             }
         }
-        for (int j = 0; j < cols; j++) {
-            vector[j] = 1.0 * (rand() % 10);  // Заполнение единицами
+        for (int i = 0; i < N; i++) {
+            vector[i] = i;
         }
+    }
 
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                printf("%f ", matrix[i * cols + j]);  // Заполнение единицами
+    double start_time = MPI_Wtime();
+
+    // Рассылка вектора всем процессам
+    if (rank != 0) {
+        vector = (int*)malloc(N * sizeof(int));
+    }
+    MPI_Bcast(vector, N, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Создание пользовательского типа данных
+    MPI_Type_vector(block_size, N, N, MPI_INT, &block_type);
+    MPI_Type_create_resized(block_type, 0, block_size * N * sizeof(int), &resized_block_type);
+    MPI_Type_commit(&resized_block_type);
+
+    // Распределение блоков матрицы
+    int* recv_block = (int*)malloc(block_size * N * sizeof(int));
+    MPI_Scatter(matrix, 1, resized_block_type, recv_block, 1, resized_block_type, 0, MPI_COMM_WORLD);
+
+    // Выделение памяти для локального результата
+    int* local_result = (int*)malloc(block_size * sizeof(int));
+
+    // Умножение блока на вектор
+    multiply_block(recv_block, vector, local_result, block_size, N);
+
+    // Сбор результатов
+    MPI_Gather(local_result, block_size, MPI_INT, result, block_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    double end_time = MPI_Wtime();
+    // Печать результатов
+    if (rank == 0) {
+        printf("Matrix:\n");
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                printf("%d ", matrix[i * N + j]);
             }
             printf("\n");
         }
-        printf("\n");
-        for (int j = 0; j < cols; j++) {
-            printf("%f ", vector[j]);  // Заполнение единицами
+        printf("Vector:\n");
+        for (int i = 0; i < M; i++) {
+            printf("%d\n", vector[i]);
         }
-        printf("\n");
-    }
-
-    // Рассылка данных
-    double* local_matrix = (double*)malloc(rows / size * cols * sizeof(double));
-    double* local_result = (double*)malloc(rows / size * sizeof(double));
-
-    // Разделение матрицы по строкам
-    MPI_Scatter(matrix, rows / size * cols, MPI_DOUBLE, local_matrix, rows / size * cols, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    // Разделение вектора по всем процессам (вектор один и тот же для всех)
-    MPI_Bcast(vector, cols, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    // Умножение подматрицы на вектор
-    matrix_vector_multiply(local_matrix, vector, local_result, rows, cols, rank, size);
-
-    // Сбор результата в процессе 0
-    MPI_Gather(local_result, rows / size, MPI_DOUBLE, result, rows / size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    // Вывод результата
-    if (rank == 0) {
-        for (int i = 0; i < rows; i++) {
-            printf("result[%d] = %f\n", i, result[i]);
+        printf("Result:\n");
+        for (int i = 0; i < M; i++) {
+            printf("%d\n", result[i]);
         }
+
+        printf("Time: %f seconds\n", end_time - start_time);
         free(matrix);
         free(vector);
         free(result);
     }
 
-    // Очистка
-    free(local_matrix);
+    free(recv_block);
     free(local_result);
+
+    MPI_Type_free(&block_type);
+    MPI_Type_free(&resized_block_type);
 
     MPI_Finalize();
     return 0;
